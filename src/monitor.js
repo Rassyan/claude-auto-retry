@@ -1,13 +1,14 @@
-import { stripAnsi, isRateLimited, findRateLimitMessage } from './patterns.js';
+import { stripAnsi, isRateLimited, classifyApiError, findRateLimitMessage } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, getPaneCommand, isProcessForeground } from './tmux.js';
+import { findActiveTranscript, readLastApiError } from './transcript.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 
 export function createMonitorState() {
-  return { status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null };
+  return { status: 'monitoring', waitUntil: 0, attempts: 0, transientAttempts: 0, waitReason: null, lastRateLimitMessage: null };
 }
 
 export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) {
@@ -20,25 +21,34 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
     if (Date.now() < state.waitUntil) return 'waiting';
     if (!isAlive()) return 'exit';
 
-    // Always check if rate limit cleared FIRST — even when maxRetries
-    // exhausted, the user (or time passing) may have resolved it.
-    if (!isRateLimited(stripped, config.customPatterns)) {
-      state.status = 'monitoring'; state.attempts = 0;
-      return 'user-continued';
-    }
-
-    if (state.attempts >= config.maxRetries) {
-      // Stay in 'waiting' to avoid re-detecting the stale rate limit
-      // on the next tick and creating an infinite max-retries loop.
-      state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
-      return 'max-retries';
+    if (state.waitReason === 'transient') {
+      // Recovery check via transcript: if the last entry is no longer a
+      // retryable API error, Claude resumed (or the user continued).
+      const apiErr = tmuxAdapter.getLastApiError ? await tmuxAdapter.getLastApiError() : null;
+      if (!apiErr || classifyApiError(apiErr.text) !== 'retryable') {
+        state.status = 'monitoring'; state.transientAttempts = 0; state.waitReason = null;
+        return 'user-continued';
+      }
+      if (state.transientAttempts >= config.maxTransientRetries) {
+        state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
+        return 'max-retries';
+      }
+    } else {
+      // Always check if rate limit cleared FIRST — even when maxRetries
+      // exhausted, the user (or time passing) may have resolved it.
+      if (!isRateLimited(stripped, config.customPatterns)) {
+        state.status = 'monitoring'; state.attempts = 0;
+        return 'user-continued';
+      }
+      if (state.attempts >= config.maxRetries) {
+        // Stay in 'waiting' to avoid re-detecting the stale rate limit
+        // on the next tick and creating an infinite max-retries loop.
+        state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
+        return 'max-retries';
+      }
     }
 
     // Primary check: is the Claude process in the foreground process group?
-    // On macOS, pane_current_command reports "zsh" instead of the child process,
-    // so we use `ps -o stat=` to check the '+' (foreground) flag directly.
-    // `true` short-circuits past pane_current_command (fixes macOS).
-    // `false`/`null` falls back to pane_current_command for safety.
     const isFg = await tmuxAdapter.isClaudeForeground();
     if (isFg !== true) {
       const fg = await tmuxAdapter.getPaneCommand(pane);
@@ -52,8 +62,15 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
 
     // Increment attempts and set cooldown BEFORE sendKeys so that a failure
     // (e.g. pane destroyed) still consumes a retry and avoids tight-loop errors.
-    state.attempts++;
-    state.waitUntil = Date.now() + 30_000;
+    if (state.waitReason === 'transient') {
+      state.transientAttempts++;
+      // Stay in 'waiting' with a 30s cooldown (matching the rate-limit path)
+      // so the transcript has time to record the new turn before we re-check.
+      state.waitUntil = Date.now() + 30_000;
+    } else {
+      state.attempts++;
+      state.waitUntil = Date.now() + 30_000;
+    }
     await tmuxAdapter.sendKeys(pane, config.retryMessage);
     return 'retried';
   }
@@ -63,14 +80,29 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
     state.lastRateLimitMessage = message;
     const parsed = message ? parseResetTime(message) : null;
     state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+    state.waitReason = null;
     state.status = 'waiting';
     return 'waiting';
+  }
+
+  // Transient API error detection — driven by the Claude Code transcript, NOT
+  // screen scraping. We only act on entries Claude itself flagged as a real
+  // API error (isApiErrorMessage), so pasted/discussed "524" text never fires.
+  if (config.maxTransientRetries > 0 && tmuxAdapter.getLastApiError) {
+    const apiErr = await tmuxAdapter.getLastApiError();
+    if (apiErr && classifyApiError(apiErr.text) === 'retryable') {
+      state.waitUntil = Date.now() + 5_000;
+      state.waitReason = 'transient';
+      state.lastTransientMessage = apiErr.text.slice(0, 80);
+      state.status = 'waiting';
+      return 'waiting';
+    }
   }
 
   return 'monitoring';
 }
 
-export async function startMonitor(pane, pid) {
+export async function startMonitor(pane, pid, cwd = process.cwd()) {
   const config = await loadConfig();
   const logger = createLogger();
   const state = createMonitorState();
@@ -79,7 +111,14 @@ export async function startMonitor(pane, pid) {
 
   await logger.info(`Monitor started for pane ${pane} (claude PID: ${pid})`);
 
-  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, isClaudeForeground: () => isProcessForeground(pid) };
+  // Resolve the active transcript once per tick (a new session writes a new
+  // file). Returns the last unrecovered API error, or null.
+  const getLastApiError = async () => {
+    const path = await findActiveTranscript(cwd);
+    return path ? readLastApiError(path) : null;
+  };
+
+  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, getLastApiError, isClaudeForeground: () => isProcessForeground(pid) };
   const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
   const loop = async () => {
@@ -88,6 +127,10 @@ export async function startMonitor(pane, pid) {
       consecutiveErrors = 0;
 
       if (result === 'exit') { await logger.info('Claude exited. Monitor shutting down.'); process.exit(0); }
+      if (result === 'waiting' && state.waitReason === 'transient' && state.lastTransientMessage) {
+        await logger.info(`API error detected: "${state.lastTransientMessage}". Retrying (${state.transientAttempts + 1}/${config.maxTransientRetries})...`);
+        state.lastTransientMessage = null;
+      }
       if (result === 'waiting' && state.lastRateLimitMessage) {
         const secs = Math.round((state.waitUntil - Date.now()) / 1000);
         await logger.info(`Rate limit detected: "${state.lastRateLimitMessage}". Waiting ${secs}s...`);
@@ -118,8 +161,8 @@ export async function startMonitor(pane, pid) {
   loop().then(scheduleNext);
 }
 
-// Direct execution: node monitor.js <pane> <pid>
+// Direct execution: node monitor.js <pane> <pid> [cwd]
 const isDirectRun = process.argv[1]?.endsWith('monitor.js') && process.argv.length >= 4;
 if (isDirectRun) {
-  startMonitor(process.argv[2], parseInt(process.argv[3], 10));
+  startMonitor(process.argv[2], parseInt(process.argv[3], 10), process.argv[4] || process.cwd());
 }

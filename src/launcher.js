@@ -54,7 +54,7 @@ async function launchInteractive(args) {
 
   // Start monitor as detached background process
   if (pane) {
-    const monitor = fork(MONITOR_PATH, [pane, String(claude.pid)], {
+    const monitor = fork(MONITOR_PATH, [pane, String(claude.pid), process.cwd()], {
       detached: true,
       stdio: 'ignore',
     });

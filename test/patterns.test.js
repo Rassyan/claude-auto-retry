@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { stripAnsi, isRateLimited, findRateLimitMessage } from '../src/patterns.js';
+import { stripAnsi, isRateLimited, findRateLimitMessage, classifyApiError } from '../src/patterns.js';
 
 describe('stripAnsi', () => {
   it('removes bold codes', () => {
@@ -126,5 +126,64 @@ describe('stripAnsi (OSC sequences)', () => {
   it('rate limit detection works through OSC hyperlinks', () => {
     const input = '\x1b]8;;link\x1b\\5-hour limit reached\x1b]8;;\x1b\\ - resets 3pm';
     assert.ok(isRateLimited(input));
+  });
+});
+
+describe('classifyApiError', () => {
+  it('classifies 524 as retryable', () => {
+    assert.equal(classifyApiError('API Error: 524 {"retryable":true}'), 'retryable');
+  });
+  it('classifies 504 gateway timeout as retryable', () => {
+    assert.equal(classifyApiError('API Error: 504 {"error_name":"origin_gateway_timeout","status":504,"retryable":true}'), 'retryable');
+  });
+  it('classifies 502/503/520/529 as retryable via status family', () => {
+    for (const code of [500, 502, 503, 520, 529]) {
+      assert.equal(classifyApiError(`API Error: ${code} something broke`), 'retryable', `code ${code}`);
+    }
+  });
+  it('honors explicit "retryable":true even with a 4xx-looking status', () => {
+    // Authoritative payload verdict wins over status heuristics.
+    assert.equal(classifyApiError('API Error: 409 {"retryable":true,"status":409}'), 'retryable');
+  });
+  it('honors explicit "retryable":false even on a 5xx', () => {
+    assert.equal(classifyApiError('API Error: 500 {"retryable":false}'), 'non-retryable');
+  });
+  it('classifies 408 request timeout as retryable', () => {
+    assert.equal(classifyApiError('API Error: 408 Request Timeout'), 'retryable');
+  });
+  it('classifies origin_response_timeout as retryable', () => {
+    assert.equal(classifyApiError('origin_response_timeout cloudflare'), 'retryable');
+  });
+  it('classifies socket/terminated as retryable', () => {
+    assert.equal(classifyApiError('API Error: The socket connection terminated'), 'retryable');
+  });
+  it('classifies overloaded as retryable', () => {
+    assert.equal(classifyApiError('overloaded, please try again'), 'retryable');
+  });
+  it('classifies an unseen transient phrasing via keyword fallback', () => {
+    assert.equal(classifyApiError('API Error: upstream temporarily unavailable, please try again'), 'retryable');
+  });
+  it('classifies 400 as non-retryable', () => {
+    assert.equal(classifyApiError('API Error: 400 参数错误'), 'non-retryable');
+  });
+  it('classifies 401/403/404 as non-retryable via status family', () => {
+    for (const code of [401, 403, 404]) {
+      assert.equal(classifyApiError(`API Error: ${code} nope`), 'non-retryable', `code ${code}`);
+    }
+  });
+  it('classifies quota exhausted as non-retryable', () => {
+    assert.equal(classifyApiError('API Error: 400 本月额度已用尽'), 'non-retryable');
+  });
+  it('classifies context-length errors as non-retryable', () => {
+    assert.equal(classifyApiError('API Error: prompt is too long, exceeds max tokens'), 'non-retryable');
+  });
+  it('quota/invalid wins even when transient words also present', () => {
+    assert.equal(classifyApiError('API Error: 400 invalid request, connection timeout'), 'non-retryable');
+  });
+  it('returns unknown for unrelated text', () => {
+    assert.equal(classifyApiError('Task completed successfully'), 'unknown');
+  });
+  it('returns unknown for empty', () => {
+    assert.equal(classifyApiError(''), 'unknown');
   });
 });

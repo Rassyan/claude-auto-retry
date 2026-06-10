@@ -70,6 +70,62 @@ export function isRateLimited(text, customPatterns = []) {
   return false;
 }
 
+// Classify a real API-error message (already confirmed via the transcript's
+// isApiErrorMessage flag) into retryable vs not. Retrying a 400 or a quota
+// error is pointless and risky; only transient server/network faults qualify.
+//
+// Strategy is layered from most authoritative to most heuristic, so unseen
+// errors are still classified sensibly:
+//   1. Explicit machine-readable verdict in the payload ("retryable":true)
+//   2. HTTP status code family (4xx client → no; 5xx server → yes)
+//   3. Keyword fallback for transport/network faults with no status code
+
+// Errors whose retryability is decided regardless of status code.
+const FORCE_NON_RETRYABLE = [
+  /额度.*用尽|用尽.*额度|额度/,                          // quota exhausted (zh)
+  /\b(quota|insufficient_quota|insufficient|credit)\b/i,
+  /\b(invalid|unauthorized|forbidden|authentication|permission)\b/i,
+  /参数错误|invalid[\s_-]?request|bad[\s_-]?request/i,
+  /context.*(too long|length|exceed)|too many tokens|max.*tokens/i,
+];
+// Transport/network faults that carry no HTTP status but are transient.
+const NETWORK_RETRYABLE = [
+  /socket|terminated|stream|aborted|reset by peer/i,
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EPIPE|EAI_AGAIN/i,
+  /\b(timeout|timed out|time-out)\b/i,
+  /\b(overloaded|unavailable|gateway|temporarily|try again)\b/i,
+  /cloudflare|origin_(response|gateway)|5xx/i,
+];
+
+export function classifyApiError(text) {
+  if (!text) return 'unknown';
+  const t = stripAnsi(text);
+
+  // Layer 1 — explicit verdict the gateway/API embedded in the payload.
+  // Cloudflare and Anthropic both emit a machine-readable retryable flag.
+  if (/"retryable"\s*:\s*false/i.test(t)) return 'non-retryable';
+  if (/"retryable"\s*:\s*true/i.test(t)) return 'retryable';
+
+  // Layer 2a — hard non-retryable signals win over everything below, so a
+  // 4xx or quota error is never hammered even if other words also match.
+  if (FORCE_NON_RETRYABLE.some(p => p.test(t))) return 'non-retryable';
+
+  // Layer 2b — HTTP status code family. Covers 500/502/503/504/520/524/529…
+  // and any future 5xx without enumerating them. 4xx (except 408/429) is
+  // client-side and not retried here (429 rate limits are handled elsewhere).
+  const status = t.match(/API Error:\s*(\d{3})\b/i) || t.match(/"(?:status|error_code)"\s*:\s*(\d{3})\b/i);
+  if (status) {
+    const code = parseInt(status[1], 10);
+    if (code === 408) return 'retryable';            // request timeout
+    if (code >= 400 && code < 500) return 'non-retryable';
+    if (code >= 500 && code < 600) return 'retryable';
+  }
+
+  // Layer 3 — keyword fallback for status-less transport errors.
+  if (NETWORK_RETRYABLE.some(p => p.test(t))) return 'retryable';
+  return 'unknown';
+}
+
 export function findRateLimitMessage(text, customPatterns = []) {
   const lines = stripAnsi(text).split('\n');
 

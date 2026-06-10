@@ -9,6 +9,7 @@ export const DEFAULT_CONFIG = {
   fallbackWaitHours: 5,
   retryMessage: 'Continue where you left off. The previous attempt was rate limited.',
   customPatterns: [],
+  maxTransientRetries: 3,
 };
 
 const CONFIG_PATH = join(homedir(), '.claude-auto-retry.json');
@@ -33,6 +34,7 @@ function validate(cfg) {
       try { new RegExp(p); return true; } catch { return false; }
     });
   }
+  cfg.maxTransientRetries = validNumber(cfg.maxTransientRetries, 0, DEFAULT_CONFIG.maxTransientRetries);
   if (cfg.foregroundCommands !== undefined) {
     if (!Array.isArray(cfg.foregroundCommands) || cfg.foregroundCommands.length === 0) {
       delete cfg.foregroundCommands;
