@@ -77,8 +77,10 @@ export function isRateLimited(text, customPatterns = []) {
 // Strategy is layered from most authoritative to most heuristic, so unseen
 // errors are still classified sensibly:
 //   1. Explicit machine-readable verdict in the payload ("retryable":true)
-//   2. HTTP status code family (4xx client → no; 5xx server → yes)
-//   3. Keyword fallback for transport/network faults with no status code
+//   2. Hard non-retryable signals (quota / auth / bad request)
+//   3. Server "try again later" wording — transient even on a 4xx status
+//   4. HTTP status code family (4xx client → no; 5xx server → yes)
+//   5. Keyword fallback for transport/network faults with no status code
 
 // Errors whose retryability is decided regardless of status code.
 const FORCE_NON_RETRYABLE = [
@@ -87,6 +89,14 @@ const FORCE_NON_RETRYABLE = [
   /\b(invalid|unauthorized|forbidden|authentication|permission)\b/i,
   /参数错误|invalid[\s_-]?request|bad[\s_-]?request/i,
   /context.*(too long|length|exceed)|too many tokens|max.*tokens/i,
+];
+// Explicit "this is temporary, retry later" wording from the server. These
+// are transient even when carried on a 4xx status (e.g. gateway 424 "no
+// account is available, please try again later" from a pooled proxy).
+const TRANSIENT_WORDING = [
+  /try again later|please (?:try again|retry)|retry later/i,
+  /no account.*available|no.*(?:capacity|slot).*available/i,
+  /temporarily|temporary|please wait|稍后(?:重试|再试)|请稍[后候]/i,
 ];
 // Transport/network faults that carry no HTTP status but are transient.
 const NETWORK_RETRYABLE = [
@@ -106,11 +116,16 @@ export function classifyApiError(text) {
   if (/"retryable"\s*:\s*false/i.test(t)) return 'non-retryable';
   if (/"retryable"\s*:\s*true/i.test(t)) return 'retryable';
 
-  // Layer 2a — hard non-retryable signals win over everything below, so a
-  // 4xx or quota error is never hammered even if other words also match.
+  // Layer 2 — hard non-retryable signals win over everything below, so a
+  // quota/auth/bad-request error is never hammered even if other words match.
   if (FORCE_NON_RETRYABLE.some(p => p.test(t))) return 'non-retryable';
 
-  // Layer 2b — HTTP status code family. Covers 500/502/503/504/520/524/529…
+  // Layer 3 — server explicitly said it's temporary ("try again later").
+  // This must precede the status-code check so a transient 4xx (e.g. a 424
+  // "no account available" from a pooled gateway) is retried, not rejected.
+  if (TRANSIENT_WORDING.some(p => p.test(t))) return 'retryable';
+
+  // Layer 4 — HTTP status code family. Covers 500/502/503/504/520/524/529…
   // and any future 5xx without enumerating them. 4xx (except 408/429) is
   // client-side and not retried here (429 rate limits are handled elsewhere).
   const status = t.match(/API Error:\s*(\d{3})\b/i) || t.match(/"(?:status|error_code)"\s*:\s*(\d{3})\b/i);
@@ -121,7 +136,7 @@ export function classifyApiError(text) {
     if (code >= 500 && code < 600) return 'retryable';
   }
 
-  // Layer 3 — keyword fallback for status-less transport errors.
+  // Layer 5 — keyword fallback for status-less transport errors.
   if (NETWORK_RETRYABLE.some(p => p.test(t))) return 'retryable';
   return 'unknown';
 }

@@ -151,6 +151,17 @@ describe('classifyApiError', () => {
   it('classifies 408 request timeout as retryable', () => {
     assert.equal(classifyApiError('API Error: 408 Request Timeout'), 'retryable');
   });
+  it('classifies a transient 424 "no account available, try again later" as retryable', () => {
+    // Real gateway error: 4xx status but the body says it is temporary.
+    assert.equal(classifyApiError('API Error: 424 no account is available, please try again later (request id: 20260622)'), 'retryable');
+  });
+  it('classifies a 4xx with "try again later" wording as retryable', () => {
+    assert.equal(classifyApiError('API Error: 429 server busy, please try again later'), 'retryable');
+  });
+  it('still rejects a 400 quota error even if it says try again', () => {
+    // FORCE_NON_RETRYABLE (quota) must win over transient wording.
+    assert.equal(classifyApiError('API Error: 400 本月额度已用尽, please try again later'), 'non-retryable');
+  });
   it('classifies origin_response_timeout as retryable', () => {
     assert.equal(classifyApiError('origin_response_timeout cloudflare'), 'retryable');
   });
