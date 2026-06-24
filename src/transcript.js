@@ -107,9 +107,14 @@ function assistantTextBlocks(entry) {
 }
 
 // Detect a leaked tool call: the last assistant turn emitted invocation markup
-// as plain text instead of an executed tool_use. Require the opening marker
-// AND a closing tag so prose that merely mentions a tag in passing doesn't
-// trip it. Returns { text } (a short snippet) or null.
+// as plain text instead of an executed tool_use.
+//
+// Precision rule (to avoid firing on prose that *discusses* the tags): a real
+// leak is where the model emitted the call and stopped, so the assistant text,
+// once trailing whitespace is trimmed, ENDS ON the closing markup — `</invoke>`
+// (complete) or `</parameter>` (truncated before the invoke closed). When the
+// tags instead appear mid-sentence with explanation after them, the text does
+// not end on a closing tag and is not treated as a leak.
 export function findLeakedToolCall(tailText) {
   const lines = tailText.split('\n').filter(l => l.trim());
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -123,9 +128,12 @@ export function findLeakedToolCall(tailText) {
 
     const text = assistantTextBlocks(entry);
     if (!text.trim()) continue;            // tool-only assistant turn, keep scanning
-    if (text.includes(INVOKE_OPEN) && (text.includes(INVOKE_CLOSE) || text.includes(PARAM_CLOSE))) {
-      const at = text.indexOf(INVOKE_OPEN);
-      return { text: text.slice(Math.max(0, at - 10), at + 60) };
+
+    const trimmed = text.replace(/\s+$/, '');
+    const endsOnClose = trimmed.endsWith(INVOKE_CLOSE) || trimmed.endsWith(PARAM_CLOSE);
+    if (trimmed.includes(INVOKE_OPEN) && endsOnClose) {
+      const at = trimmed.indexOf(INVOKE_OPEN);
+      return { text: trimmed.slice(Math.max(0, at - 10), at + 60) };
     }
     return null;                           // latest assistant turn is clean
   }

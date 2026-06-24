@@ -160,6 +160,11 @@ describe('findLeakedToolCall', () => {
     const r = findLeakedToolCall(tail);
     assert.ok(r, 'should detect leaked markup');
   });
+  it('detects a leak truncated mid-call (ends on </parameter>)', () => {
+    // Real capture: the leak was cut off before the invoke closed.
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: '先 clone。\ncard\n' + O + P + PC }] } });
+    assert.ok(findLeakedToolCall(tail), 'should detect a truncated leak ending on </parameter>');
+  });
   it('does NOT match a real tool_use block (correct call)', () => {
     const tail = line({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } });
     assert.equal(findLeakedToolCall(tail), null);
@@ -167,6 +172,17 @@ describe('findLeakedToolCall', () => {
   it('does NOT match prose that merely mentions the tag name', () => {
     const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: '我会用 invoke 调用工具' }] } });
     assert.equal(findLeakedToolCall(tail), null);
+  });
+  it('does NOT fire when tags appear mid-sentence with explanation after (meta-discussion)', () => {
+    // The exact false-positive risk: discussing the markup. Tags are present
+    // AND closed, but the text continues with prose, so it does not END on a
+    // closing tag.
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: '比如 ' + O + P + PC + IC + ' 这种结构就是泄漏，我会避免它。' }] } });
+    assert.equal(findLeakedToolCall(tail), null, 'discussion must not trigger');
+  });
+  it('tolerates trailing whitespace/newlines after the closing tag', () => {
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: O + P + PC + IC + '\n\n  ' }] } });
+    assert.ok(findLeakedToolCall(tail), 'trailing whitespace should not defeat detection');
   });
   it('detects leak even with trailing bookkeeping entries', () => {
     const tail = [
