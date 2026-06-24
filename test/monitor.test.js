@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createMonitorState, processOneTick } from '../src/monitor.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
 
-function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = true, apiError = null) {
+function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = true, apiError = null, leak = null) {
   const t = {
     _sent: [],
     capturePane: async () => paneContent,
@@ -11,6 +11,7 @@ function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = tru
     sendKeys: async (_p, text) => { t._sent.push(text); },
     isClaudeForeground: async () => claudeForeground,
     getLastApiError: async () => apiError,
+    getLeakedToolCall: async () => leak,
   };
   return t;
 }
@@ -175,5 +176,51 @@ describe('processOneTick', () => {
     const config = { ...DEFAULT_CONFIG, maxTransientRetries: 0 };
     assert.equal(await processOneTick(s, t, '%0', config, () => true), 'monitoring');
     assert.equal(t._sent.length, 0);
+  });
+
+  it('enters waiting on leaked tool-call from transcript', async () => {
+    const t = mockTmux('Normal screen', 'node', true, null, { text: 'card <invoke name=' });
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.equal(s.waitReason, 'leaked');
+  });
+  it('sends the leaked-tool-call message (not retryMessage) on retry', async () => {
+    const t = mockTmux('Normal screen', 'node', true, null, { text: 'leak snippet' });
+    const s = createMonitorState();
+    s.status = 'waiting'; s.waitUntil = Date.now() - 1; s.waitReason = 'leaked';
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+    assert.equal(t._sent.length, 1);
+    assert.equal(t._sent[0], DEFAULT_CONFIG.leakedToolCallMessage);
+    assert.equal(s.leakedAttempts, 1);
+  });
+  it('leaked: user-continued resets when leak clears in transcript', async () => {
+    const t = mockTmux('Normal screen', 'node', true, null, null);
+    const s = createMonitorState();
+    s.status = 'waiting'; s.waitUntil = Date.now() - 1; s.waitReason = 'leaked'; s.leakedAttempts = 1;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+    assert.equal(s.leakedAttempts, 0);
+    assert.equal(s.waitReason, null);
+  });
+  it('leaked: stops after maxLeakedToolCallRetries', async () => {
+    const t = mockTmux('Normal screen', 'node', true, null, { text: 'leak' });
+    const s = createMonitorState();
+    s.status = 'waiting'; s.waitUntil = Date.now() - 1; s.waitReason = 'leaked';
+    s.leakedAttempts = DEFAULT_CONFIG.maxLeakedToolCallRetries;
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'max-retries');
+    assert.equal(t._sent.length, 0);
+  });
+  it('skips leaked detection when maxLeakedToolCallRetries is 0', async () => {
+    const t = mockTmux('Normal screen', 'node', true, null, { text: 'leak' });
+    const s = createMonitorState();
+    const config = { ...DEFAULT_CONFIG, maxLeakedToolCallRetries: 0 };
+    assert.equal(await processOneTick(s, t, '%0', config, () => true), 'monitoring');
+    assert.equal(t._sent.length, 0);
+  });
+  it('rate limit and transient take priority over leaked', async () => {
+    // transient (API error) present alongside a leak → transient wins
+    const t = mockTmux('Normal', 'node', true, { text: 'API Error: 524' }, { text: 'leak' });
+    const s = createMonitorState();
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+    assert.equal(s.waitReason, 'transient');
   });
 });

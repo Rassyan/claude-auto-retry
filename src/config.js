@@ -10,6 +10,8 @@ export const DEFAULT_CONFIG = {
   retryMessage: 'Continue where you left off. The previous attempt was rate limited.',
   customPatterns: [],
   maxTransientRetries: 3,
+  maxLeakedToolCallRetries: 3,
+  leakedToolCallMessage: '你的 invoke 输出成文本了，能彻底杜绝吗',
 };
 
 const CONFIG_PATH = join(homedir(), '.claude-auto-retry.json');
@@ -35,6 +37,10 @@ function validate(cfg) {
     });
   }
   cfg.maxTransientRetries = validNumber(cfg.maxTransientRetries, 0, DEFAULT_CONFIG.maxTransientRetries);
+  cfg.maxLeakedToolCallRetries = validNumber(cfg.maxLeakedToolCallRetries, 0, DEFAULT_CONFIG.maxLeakedToolCallRetries);
+  if (typeof cfg.leakedToolCallMessage !== 'string' || !cfg.leakedToolCallMessage) {
+    cfg.leakedToolCallMessage = DEFAULT_CONFIG.leakedToolCallMessage;
+  }
   if (cfg.foregroundCommands !== undefined) {
     if (!Array.isArray(cfg.foregroundCommands) || cfg.foregroundCommands.length === 0) {
       delete cfg.foregroundCommands;

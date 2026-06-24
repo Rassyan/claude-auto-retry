@@ -88,6 +88,56 @@ export async function readLastApiError(path) {
   return findLastApiError(tail);
 }
 
+// Markers of a tool invocation, built from fragments so this source file
+// itself never contains the literal trigger strings.
+const INVOKE_OPEN = '<' + 'invoke name=';
+const INVOKE_CLOSE = '</' + 'invoke>';
+const PARAM_CLOSE = '</' + 'parameter>';
+
+// Concatenate only the TEXT blocks of an assistant entry. A correctly parsed
+// tool call lives in a tool_use block (not text), so it is intentionally
+// excluded — only invocation markup that leaked into prose shows up here.
+function assistantTextBlocks(entry) {
+  const c = entry?.message?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c.filter(b => b && b.type === 'text').map(b => b.text || '').join('\n');
+  }
+  return '';
+}
+
+// Detect a leaked tool call: the last assistant turn emitted invocation markup
+// as plain text instead of an executed tool_use. Require the opening marker
+// AND a closing tag so prose that merely mentions a tag in passing doesn't
+// trip it. Returns { text } (a short snippet) or null.
+export function findLeakedToolCall(tailText) {
+  const lines = tailText.split('\n').filter(l => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let entry;
+    try { entry = JSON.parse(lines[i]); } catch { continue; }
+
+    const type = entry.type;
+    // Skip bookkeeping; a real user turn after the leak means it recovered.
+    if (type !== 'user' && type !== 'assistant') continue;
+    if (type === 'user') return null;
+
+    const text = assistantTextBlocks(entry);
+    if (!text.trim()) continue;            // tool-only assistant turn, keep scanning
+    if (text.includes(INVOKE_OPEN) && (text.includes(INVOKE_CLOSE) || text.includes(PARAM_CLOSE))) {
+      const at = text.indexOf(INVOKE_OPEN);
+      return { text: text.slice(Math.max(0, at - 10), at + 60) };
+    }
+    return null;                           // latest assistant turn is clean
+  }
+  return null;
+}
+
+export async function readLeakedToolCall(path) {
+  let tail;
+  try { tail = await readTail(path); } catch { return null; }
+  return findLeakedToolCall(tail);
+}
+
 // Read only the tail of a (potentially huge) transcript file — these can grow
 // to hundreds of MB, so we never load the whole thing. 256KB comfortably holds
 // many entries even when a single line runs to tens of KB (large tool results

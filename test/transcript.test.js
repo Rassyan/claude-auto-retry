@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { encodeCwd, entryText, findLastApiError, readLastApiError } from '../src/transcript.js';
+import { encodeCwd, entryText, findLastApiError, readLastApiError, findLeakedToolCall } from '../src/transcript.js';
 
 describe('encodeCwd', () => {
   it('replaces slashes and dots with dashes', () => {
@@ -144,5 +144,47 @@ describe('readLastApiError (real file I/O)', () => {
 
   it('returns null for a nonexistent file (no throw)', async () => {
     assert.equal(await readLastApiError('/no/such/transcript.jsonl'), null);
+  });
+});
+
+describe('findLeakedToolCall', () => {
+  // Build markers from fragments so this test file never contains the literal
+  // trigger strings (which would otherwise make it a leak sample of itself).
+  const O = '<' + 'invoke name="Bash">';
+  const P = '<' + 'parameter name="command">ls';
+  const PC = '</' + 'parameter>';
+  const IC = '</' + 'invoke>';
+
+  it('detects a leaked invocation in the last assistant text block', () => {
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: '我来执行 ' + O + P + PC + IC }] } });
+    const r = findLeakedToolCall(tail);
+    assert.ok(r, 'should detect leaked markup');
+  });
+  it('does NOT match a real tool_use block (correct call)', () => {
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] } });
+    assert.equal(findLeakedToolCall(tail), null);
+  });
+  it('does NOT match prose that merely mentions the tag name', () => {
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: '我会用 invoke 调用工具' }] } });
+    assert.equal(findLeakedToolCall(tail), null);
+  });
+  it('detects leak even with trailing bookkeeping entries', () => {
+    const tail = [
+      line({ type: 'assistant', message: { content: [{ type: 'text', text: O + PC + IC }] } }),
+      line({ type: 'system', content: '' }),
+      line({ type: 'file-history-snapshot', snapshot: {} }),
+    ].join('\n');
+    assert.ok(findLeakedToolCall(tail));
+  });
+  it('returns null once a user turn follows the leak (recovered)', () => {
+    const tail = [
+      line({ type: 'assistant', message: { content: [{ type: 'text', text: O + PC + IC }] } }),
+      line({ type: 'user', message: { content: '你的 invoke 输出成文本了，能彻底杜绝吗' } }),
+    ].join('\n');
+    assert.equal(findLeakedToolCall(tail), null);
+  });
+  it('returns null for a clean assistant turn', () => {
+    const tail = line({ type: 'assistant', message: { content: [{ type: 'text', text: '任务完成了' }] } });
+    assert.equal(findLeakedToolCall(tail), null);
   });
 });

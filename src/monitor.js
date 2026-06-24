@@ -1,14 +1,14 @@
 import { stripAnsi, isRateLimited, classifyApiError, findRateLimitMessage } from './patterns.js';
 import { parseResetTime, calculateWaitMs } from './time-parser.js';
 import { capturePane, sendKeys, getPaneCommand, isProcessForeground } from './tmux.js';
-import { findActiveTranscript, readLastApiError } from './transcript.js';
+import { findActiveTranscript, readLastApiError, readLeakedToolCall } from './transcript.js';
 import { loadConfig } from './config.js';
 import { createLogger } from './logger.js';
 
 const DEFAULT_FOREGROUND_COMMANDS = ['node', 'claude', 'npx', 'tsx', 'bun', 'deno'];
 
 export function createMonitorState() {
-  return { status: 'monitoring', waitUntil: 0, attempts: 0, transientAttempts: 0, waitReason: null, lastRateLimitMessage: null };
+  return { status: 'monitoring', waitUntil: 0, attempts: 0, transientAttempts: 0, leakedAttempts: 0, waitReason: null, lastRateLimitMessage: null };
 }
 
 export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) {
@@ -30,6 +30,18 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
         return 'user-continued';
       }
       if (state.transientAttempts >= config.maxTransientRetries) {
+        state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
+        return 'max-retries';
+      }
+    } else if (state.waitReason === 'leaked') {
+      // Recovery check: the leaked tool-call markup is gone from the last
+      // assistant turn (Claude redid the call, or the user moved on).
+      const leak = tmuxAdapter.getLeakedToolCall ? await tmuxAdapter.getLeakedToolCall() : null;
+      if (!leak) {
+        state.status = 'monitoring'; state.leakedAttempts = 0; state.waitReason = null;
+        return 'user-continued';
+      }
+      if (state.leakedAttempts >= config.maxLeakedToolCallRetries) {
         state.waitUntil = Date.now() + (config.pollIntervalSeconds * 1000 * 12);
         return 'max-retries';
       }
@@ -62,16 +74,22 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
 
     // Increment attempts and set cooldown BEFORE sendKeys so that a failure
     // (e.g. pane destroyed) still consumes a retry and avoids tight-loop errors.
+    // The message sent depends on what we're recovering from.
+    let message = config.retryMessage;
     if (state.waitReason === 'transient') {
       state.transientAttempts++;
       // Stay in 'waiting' with a 30s cooldown (matching the rate-limit path)
       // so the transcript has time to record the new turn before we re-check.
       state.waitUntil = Date.now() + 30_000;
+    } else if (state.waitReason === 'leaked') {
+      state.leakedAttempts++;
+      state.waitUntil = Date.now() + 30_000;
+      message = config.leakedToolCallMessage;
     } else {
       state.attempts++;
       state.waitUntil = Date.now() + 30_000;
     }
-    await tmuxAdapter.sendKeys(pane, config.retryMessage);
+    await tmuxAdapter.sendKeys(pane, message);
     return 'retried';
   }
 
@@ -99,6 +117,21 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
     }
   }
 
+  // Leaked tool-call detection — also transcript-driven. Fires when the last
+  // assistant turn emitted invocation markup as plain text instead of an
+  // executed tool_use (only text blocks are inspected, so a real tool_use
+  // never matches).
+  if (config.maxLeakedToolCallRetries > 0 && tmuxAdapter.getLeakedToolCall) {
+    const leak = await tmuxAdapter.getLeakedToolCall();
+    if (leak) {
+      state.waitUntil = Date.now() + 5_000;
+      state.waitReason = 'leaked';
+      state.lastLeakedMessage = leak.text;
+      state.status = 'waiting';
+      return 'waiting';
+    }
+  }
+
   return 'monitoring';
 }
 
@@ -117,8 +150,12 @@ export async function startMonitor(pane, pid, cwd = process.cwd()) {
     const path = await findActiveTranscript(cwd);
     return path ? readLastApiError(path) : null;
   };
+  const getLeakedToolCall = async () => {
+    const path = await findActiveTranscript(cwd);
+    return path ? readLeakedToolCall(path) : null;
+  };
 
-  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, getLastApiError, isClaudeForeground: () => isProcessForeground(pid) };
+  const tmuxAdapter = { capturePane, sendKeys, getPaneCommand, getLastApiError, getLeakedToolCall, isClaudeForeground: () => isProcessForeground(pid) };
   const isAlive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
   const loop = async () => {
@@ -130,6 +167,10 @@ export async function startMonitor(pane, pid, cwd = process.cwd()) {
       if (result === 'waiting' && state.waitReason === 'transient' && state.lastTransientMessage) {
         await logger.info(`API error detected: "${state.lastTransientMessage}". Retrying (${state.transientAttempts + 1}/${config.maxTransientRetries})...`);
         state.lastTransientMessage = null;
+      }
+      if (result === 'waiting' && state.waitReason === 'leaked' && state.lastLeakedMessage) {
+        await logger.info(`Leaked tool-call detected: "${state.lastLeakedMessage}". Nudging (${state.leakedAttempts + 1}/${config.maxLeakedToolCallRetries})...`);
+        state.lastLeakedMessage = null;
       }
       if (result === 'waiting' && state.lastRateLimitMessage) {
         const secs = Math.round((state.waitUntil - Date.now()) / 1000);
