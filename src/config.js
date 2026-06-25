@@ -10,6 +10,7 @@ export const DEFAULT_CONFIG = {
   retryMessage: 'Continue where you left off. The previous attempt was rate limited.',
   customPatterns: [],
   maxTransientRetries: 3,
+  retryableErrorPatterns: [],
   maxLeakedToolCallRetries: 3,
   leakedToolCallMessage: '你的 invoke 输出成文本了，能彻底杜绝吗',
 };
@@ -37,6 +38,14 @@ function validate(cfg) {
     });
   }
   cfg.maxTransientRetries = validNumber(cfg.maxTransientRetries, 0, DEFAULT_CONFIG.maxTransientRetries);
+  if (!Array.isArray(cfg.retryableErrorPatterns)) {
+    cfg.retryableErrorPatterns = DEFAULT_CONFIG.retryableErrorPatterns;
+  } else {
+    cfg.retryableErrorPatterns = cfg.retryableErrorPatterns.filter(p => {
+      if (typeof p !== 'string') return false;
+      try { new RegExp(p); return true; } catch { return false; }
+    });
+  }
   cfg.maxLeakedToolCallRetries = validNumber(cfg.maxLeakedToolCallRetries, 0, DEFAULT_CONFIG.maxLeakedToolCallRetries);
   if (typeof cfg.leakedToolCallMessage !== 'string' || !cfg.leakedToolCallMessage) {
     cfg.leakedToolCallMessage = DEFAULT_CONFIG.leakedToolCallMessage;

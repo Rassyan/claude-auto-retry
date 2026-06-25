@@ -107,13 +107,22 @@ const NETWORK_RETRYABLE = [
   /cloudflare|origin_(response|gateway)|5xx/i,
 ];
 
-export function classifyApiError(text) {
+export function classifyApiError(text, retryablePatterns = []) {
   if (!text) return 'unknown';
   const t = stripAnsi(text);
 
-  // Layer 1 — explicit verdict the gateway/API embedded in the payload.
-  // Cloudflare and Anthropic both emit a machine-readable retryable flag.
+  // Layer 0 — user-supplied "force retryable" patterns (highest priority after
+  // an explicit machine-readable false). For gateways that rotate to another
+  // pooled account on retry, errors like "用户额度不足/请充值后重试" ARE worth
+  // retrying even though they look like quota errors. This is gateway-specific
+  // behavior, so it is opt-in via config rather than a built-in default.
   if (/"retryable"\s*:\s*false/i.test(t)) return 'non-retryable';
+  if (retryablePatterns.length > 0) {
+    const pats = retryablePatterns.map(p => typeof p === 'string' ? new RegExp(p, 'i') : p);
+    if (pats.some(p => p.test(t))) return 'retryable';
+  }
+
+  // Layer 1 — explicit verdict the gateway/API embedded in the payload.
   if (/"retryable"\s*:\s*true/i.test(t)) return 'retryable';
 
   // Layer 2 — hard non-retryable signals win over everything below, so a

@@ -197,4 +197,17 @@ describe('classifyApiError', () => {
   it('returns unknown for empty', () => {
     assert.equal(classifyApiError(''), 'unknown');
   });
+  it('user retryablePatterns force a quota-like error to retryable', () => {
+    // Gateway that rotates accounts on retry: "用户额度不足/请充值后重试" is retryable.
+    const e = 'API Error: 403 用户额度不足, 剩余额度: $-3.66, 请充值后重试';
+    assert.equal(classifyApiError(e), 'non-retryable');               // default: not retried
+    assert.equal(classifyApiError(e, ['请充值', '用户额度不足']), 'retryable'); // opt-in: retried
+  });
+  it('explicit "retryable":false still wins over user patterns', () => {
+    const e = 'API Error: 用户额度不足 {"retryable":false}';
+    assert.equal(classifyApiError(e, ['用户额度不足']), 'non-retryable');
+  });
+  it('user patterns do not affect unrelated errors', () => {
+    assert.equal(classifyApiError('API Error: 400 参数错误', ['请充值']), 'non-retryable');
+  });
 });

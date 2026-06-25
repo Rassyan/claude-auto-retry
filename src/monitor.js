@@ -25,7 +25,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
       // Recovery check via transcript: if the last entry is no longer a
       // retryable API error, Claude resumed (or the user continued).
       const apiErr = tmuxAdapter.getLastApiError ? await tmuxAdapter.getLastApiError() : null;
-      if (!apiErr || classifyApiError(apiErr.text) !== 'retryable') {
+      if (!apiErr || classifyApiError(apiErr.text, config.retryableErrorPatterns) !== 'retryable') {
         state.status = 'monitoring'; state.transientAttempts = 0; state.waitReason = null;
         return 'user-continued';
       }
@@ -108,7 +108,7 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive) 
   // API error (isApiErrorMessage), so pasted/discussed "524" text never fires.
   if (config.maxTransientRetries > 0 && tmuxAdapter.getLastApiError) {
     const apiErr = await tmuxAdapter.getLastApiError();
-    if (apiErr && classifyApiError(apiErr.text) === 'retryable') {
+    if (apiErr && classifyApiError(apiErr.text, config.retryableErrorPatterns) === 'retryable') {
       state.waitUntil = Date.now() + 5_000;
       state.waitReason = 'transient';
       state.lastTransientMessage = apiErr.text.slice(0, 80);

@@ -64,6 +64,17 @@ describe('loadConfig', () => {
       assert.deepEqual(config.customPatterns, ["valid"]);
     } finally { await unlink(f); }
   });
+  it('filters invalid retryableErrorPatterns and keeps valid ones', async () => {
+    const { writeFile, unlink } = await import('node:fs/promises');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const f = join(tmpdir(), `car-test-${Date.now()}-r.json`);
+    await writeFile(f, JSON.stringify({ retryableErrorPatterns: ["请充值", 7, "[bad"] }));
+    try {
+      const config = await loadConfig(f);
+      assert.deepEqual(config.retryableErrorPatterns, ["请充值"]);
+    } finally { await unlink(f); }
+  });
   it('rejects negative numbers and falls back to defaults', async () => {
     const { writeFile, unlink } = await import('node:fs/promises');
     const { tmpdir } = await import('node:os');
